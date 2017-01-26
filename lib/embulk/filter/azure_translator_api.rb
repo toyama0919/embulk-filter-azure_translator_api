@@ -1,5 +1,4 @@
-require 'crack/xml'
-require 'rest-client'
+require_relative  'azure_translator_api/azure_translator_client'
 
 module Embulk
   module Filter
@@ -7,19 +6,13 @@ module Embulk
     class AzureTranslatorApi < FilterPlugin
       Plugin.register_filter("azure_translator_api", self)
 
-      AUTH_ENDPOINT_PREFIX = "https://api.cognitive.microsoft.com/sts/v1.0/issueToken"
-      ENDPOINT_PREFIX = "https://api.microsofttranslator.com/v2/http.svc"
-
       def self.transaction(config, in_schema, &control)
         task = {
           "api_type" => config.param("api_type", :string),
-          "language" => config.param("language", :string, default: nil),
           "out_key_name_suffix" => config.param("out_key_name_suffix", :string),
           "key_names" => config.param("key_names", :array),
-          "body_params" => config.param("body_params", :hash, default: {}),
           "params" => config.param("params", :hash, default: {}),
           "delay" => config.param("delay", :integer, default: 0),
-          "per_request" => config.param("per_request", :integer, default: 1),
           "subscription_key" => config.param("subscription_key", :string),
           "content_type" => config.param("content_type", :string, default: nil),
           "category" => config.param("category", :string, default: nil),
@@ -32,36 +25,27 @@ module Embulk
         end
 
         out_columns = in_schema + add_columns
-        task['authorization_token'] = get_authorization_token(task["subscription_key"])
+        task['authorization_token'] = AzureTranslatorClient.get_authorization_token(task["subscription_key"])
 
         yield(task, out_columns)
       end
 
-      def self.get_authorization_token(subscription_key)
-        RestClient.post AUTH_ENDPOINT_PREFIX, "", {
-          params: { 'Subscription-Key' => subscription_key }
-        }
-      end
-
       def init
-        uri_string = "#{ENDPOINT_PREFIX}/#{task['api_type']}"
-
-        @body_params = task['body_params']
-        @per_request = task['per_request']
         @delay = task['delay']
         @key_names = task['key_names']
         @out_key_name_suffix = task['out_key_name_suffix']
-        @language = task['language']
-        @content_type = task['content_type']
-        @records = []
-        @params = {
+
+        params = {
           'to' => task['to'],
         }
-        @params['from'] = task['from'] if task['from']
-        @params['content_type'] = task['content_type'] if task['content_type']
-        @params['category'] = task['category'] if task['category']
-        @authorization_token = task['authorization_token']
-        @resource = RestClient::Resource.new uri_string
+        params['from'] = task['from'] if task['from']
+        params['content_type'] = task['content_type'] if task['content_type']
+        params['category'] = task['category'] if task['category']
+        @client = AzureTranslatorClient.new(
+          params: params,
+          authorization_token: task['authorization_token'],
+          api_type: task['api_type']
+        )
       end
 
       def close
@@ -73,31 +57,16 @@ module Embulk
         end
 
         records.each do |record|
-          page_builder.add(proc_record(record).values)
+          @key_names.each do |key_name|
+            record[key_name + @out_key_name_suffix] = @client.translate_text(record[key_name])
+          end
+          page_builder.add(record.values)
           sleep @delay
         end
       end
 
       def finish
         page_builder.finish
-      end
-
-      private
-      def proc_record(record)
-        @key_names.each do |key_name|
-          request_param = { text: record[key_name] }.merge(@params)
-          Embulk.logger.debug("request_param => #{request_param}")
-          response_hash = ::Crack::XML.parse(
-            @resource.get(
-              {
-                Authorization: "Bearer #{@authorization_token}",
-                params: request_param
-              }
-            ) 
-          )
-          record[key_name + @out_key_name_suffix] = response_hash['string']
-        end
-        record
       end
     end
   end
